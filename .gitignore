@@ -1,0 +1,9 @@
+__pycache__/
+.DS_Store
+*.xlsx
+input_folder/
+output_folder/
+setting.json
+excel_tool_data_procceser copy.py
+Input copy.xlsx
+正解Input copy.xlsx

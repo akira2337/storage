@@ -1,9 +1,11 @@
+import copy
+from contextlib import closing
 import glob
 import json
 import os
 import re
 import openpyxl
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles import Protection
 import pandas as pd
 
 # ==========================================
@@ -29,6 +31,18 @@ TEXT_COL_INDICES = config["text_col_indices"]
 CIRCLED_MAPPING = config["mapping"]
 CIRCLED_NUMS = config["circled_nums"]
 CIRCLED_TO_IDX = {num: i for i, num in enumerate(CIRCLED_NUMS)}
+CIRCLED_CHARS = "".join(
+    sorted({
+        char
+        for char in [*CIRCLED_MAPPING.keys(), *CIRCLED_NUMS]
+        if len(char) == 1 and not char.isascii()
+    })
+)
+ALL_CIRCLED_CHARS = f"[{re.escape(CIRCLED_CHARS)}]"
+PREFIX_PATTERN = re.compile(
+    rf"^((?:{ALL_CIRCLED_CHARS}\s*(?:[〜~-]\s*{ALL_CIRCLED_CHARS})?"
+    rf"\s*[、,]?\s*)+)(?:[:：]\s*)?(.*)$"
+)
 
 
 # ==========================================
@@ -38,68 +52,109 @@ def normalize_circled_number(char):
   return CIRCLED_MAPPING.get(char, char)
 
 
+def expand_prefix_to_nums(prefix):
+  """プレフィックス（例: '①〜③、⑤' や '①②③'）から
+
+  該当する丸数字のリスト（重複なし・順序維持）を抽出・展開する関数
+  """
+  expanded = []
+  parts = re.split(r"[、,]", prefix)
+
+  for part in parts:
+    part = part.strip()
+    if not part:
+      continue
+
+    # 範囲指定のチェック（例: ①〜③）
+    range_match = re.search(
+        rf"({ALL_CIRCLED_CHARS})\s*[〜~-]\s*({ALL_CIRCLED_CHARS})", part
+    )
+    if range_match:
+      start_char, end_char = range_match.groups()
+      norm_start = normalize_circled_number(start_char)
+      norm_end = normalize_circled_number(end_char)
+      start_idx = CIRCLED_TO_IDX.get(norm_start, 0)
+      end_idx = CIRCLED_TO_IDX.get(norm_end, 0)
+      if start_idx <= end_idx:
+        for idx in range(start_idx, end_idx + 1):
+          if idx < len(CIRCLED_NUMS):
+            num_char = CIRCLED_NUMS[idx]
+            if num_char not in expanded:
+              expanded.append(num_char)
+      continue
+
+    # 個別または連続する丸数字のチェック
+    found_in_part = re.findall(rf"{ALL_CIRCLED_CHARS}", part)
+    if found_in_part:
+      for num_char in found_in_part:
+        norm_char = normalize_circled_number(num_char)
+        if norm_char in CIRCLED_TO_IDX:
+          if norm_char not in expanded:
+            expanded.append(norm_char)
+
+  return expanded
+
+
 def parse_cell_to_blocks(text):
+  """セル内のテキストを解析し、
+
+  {丸数字: [その丸数字が属するテキスト項目のリスト]} と、
+  共通テキストを抽出する
+  """
   if pd.isna(text) or not str(text).strip():
     return {}, []
 
   lines = [line.strip() for line in str(text).splitlines() if line.strip()]
-  mapping = {}
+  # 各丸数字に紐づくテキストブロックのリストを保持する辞書
+  mapping = {num: [] for num in CIRCLED_NUMS}
   common_texts = []
-  all_circled_chars = r"[①-㉚❶-❿➀-➉➊-➓⓵-⓾]"
 
   for line in lines:
-    match = re.match(rf"^([{all_circled_chars}0-9\-〜〜、,\s]+)([:：].*)?$", line)
+    match = PREFIX_PATTERN.match(line)
     if not match:
       common_texts.append(line)
       continue
 
     prefix = match.group(1).strip()
-    body = match.group(2) if match.group(2) else ""
-    body = re.sub(r"^[:：]\s*", "", body).strip()
-
-    if not body and not re.search(rf"{all_circled_chars}", prefix):
-      common_texts.append(line)
-      continue
-    elif not body:
+    body = match.group(2).strip()
+    if not body:
       body = line
 
-    expanded_nums = set()
-    parts = re.split(r"[、,]", prefix)
+    nums_in_line = expand_prefix_to_nums(prefix)
 
-    for part in parts:
-      part = part.strip()
-      if not part:
-        continue
-
-      range_match = re.search(
-          rf"({all_circled_chars})\s*[〜〜-]\s*({all_circled_chars})", part
-      )
-      if range_match:
-        start_char, end_char = range_match.groups()
-        norm_start = normalize_circled_number(start_char)
-        norm_end = normalize_circled_number(end_char)
-        start_idx = CIRCLED_TO_IDX.get(norm_start, 0)
-        end_idx = CIRCLED_TO_IDX.get(norm_end, 0)
-        if start_idx <= end_idx:
-          for idx in range(start_idx, end_idx + 1):
-            if idx < len(CIRCLED_NUMS):
-              expanded_nums.add(CIRCLED_NUMS[idx])
-        continue
-
-      found_in_part = re.findall(rf"{all_circled_chars}", part)
-      if found_in_part:
-        for num_char in found_in_part:
-          norm_char = normalize_circled_number(num_char)
-          if norm_char in CIRCLED_TO_IDX:
-            expanded_nums.add(norm_char)
-
-    if expanded_nums:
-      for num in expanded_nums:
-        mapping[num] = body
+    if nums_in_line:
+      for num in nums_in_line:
+        mapping[num].append(body)
     else:
       common_texts.append(line)
 
   return mapping, common_texts
+
+
+def format_cell_value(num, bodies, common_texts=None, include_num=True):
+  """指定丸数字に紐づく本文と共通本文を1つのセル値にまとめる。"""
+  values = []
+  if bodies:
+    values.extend(f"{num}：{body}" if include_num else f"{num}{body}" for body in bodies)
+  if common_texts:
+    values.extend(common_texts)
+  return "\n".join(values) if values else "ー"
+
+
+def fill_empty_cells(row):
+  for col_idx in range(len(row)):
+    val = row.iloc[col_idx]
+    if pd.isna(val) or str(val).strip() == "":
+      row.iloc[col_idx] = "ー"
+  return row
+
+
+def copy_cell_format(source_cell, target_cell):
+  if source_cell.has_style:
+    target_cell._style = copy.copy(source_cell._style)
+  target_cell.number_format = source_cell.number_format
+  target_cell.alignment = copy.copy(source_cell.alignment)
+  target_cell.protection = copy.copy(source_cell.protection)
 
 
 # ==========================================
@@ -150,15 +205,19 @@ for input_file in excel_files:
       tool_cell = row.iloc[TOOL_COL_IDX]
       tool_dict, tool_common = parse_cell_to_blocks(tool_cell)
 
-      if not tool_dict:
+      # ツール一覧に属する有効な丸数字を抽出（順番通り）
+      active_tool_nums = []
+      for num in CIRCLED_NUMS:
+        if num in tool_dict and tool_dict[num]:
+          active_tool_nums.append(num)
+
+      # ツール一覧に丸数字がない場合のフォールバック
+      if not active_tool_nums:
         new_row = row.copy()
-        for col_idx in range(len(new_row)):
-          val = new_row.iloc[col_idx]
-          if pd.isna(val) or str(val).strip() == "":
-            new_row.iloc[col_idx] = "ー"
-        new_rows.append(new_row)
+        new_rows.append(fill_empty_cells(new_row))
         continue
 
+      # 各テキスト列のセルを事前に解析
       text_dicts = {}
       text_commons = {}
       for t_idx in TEXT_COL_INDICES:
@@ -170,74 +229,63 @@ for input_file in excel_files:
           text_dicts[t_idx] = {}
           text_commons[t_idx] = []
 
-      for num, tool_text in tool_dict.items():
+      # ツール一覧の各丸数字をベースに行を展開
+      for num in active_tool_nums:
         new_row = row.copy()
-        new_row.iloc[TOOL_COL_IDX] = tool_text
+        # ツール一覧の値をセット（例: ①ツールA）
+        new_row.iloc[TOOL_COL_IDX] = format_cell_value(
+            num, tool_dict[num], tool_common, include_num=False
+        )
 
+        # 各テキスト列の処理
         for t_idx in TEXT_COL_INDICES:
           if t_idx < len(row):
             t_dict = text_dicts[t_idx]
             t_comm = text_commons[t_idx]
 
-            if num in t_dict:
-              body_text = t_dict[num]
-              new_row.iloc[t_idx] = f"{num}：{body_text}"
+            if num in t_dict and t_dict[num]:
+              new_row.iloc[t_idx] = format_cell_value(
+                  num, t_dict[num], t_comm, include_num=True
+              )
             elif t_comm:
               new_row.iloc[t_idx] = "\n".join(t_comm)
             else:
               new_row.iloc[t_idx] = "ー"
 
-        for col_idx in range(len(new_row)):
-          val = new_row.iloc[col_idx]
-          if pd.isna(val) or str(val).strip() == "":
-            new_row.iloc[col_idx] = "ー"
-
-        new_rows.append(new_row)
+        # その他の空白セルを「ー」で埋める
+        new_rows.append(fill_empty_cells(new_row))
 
     df_result = pd.DataFrame(new_rows)
 
     # ------------------------------------------
-    # B. フォーマット維持の書き出し (Openpyxl + with文)
+    # B. フォーマット維持の書き出し
     # ------------------------------------------
-    with openpyxl.load_workbook(input_file) as wb:
+    with closing(openpyxl.load_workbook(input_file)) as wb:
       ws = wb[TARGET_SHEET_NAME]
 
-      START_ROW = 6
+      start_row = HEADER_ROW + 2
+      ws.protection.sheet = False
       max_row = ws.max_row
-      for row in ws.iter_rows(min_row=START_ROW, max_row=max_row):
+      for row in ws.iter_rows(min_row=start_row, max_row=max_row):
         for cell in row:
           cell.value = None
+          cell.protection = copy.copy(Protection(locked=False))
 
-      for i, row_data in df_result.iterrows():
-        current_row = START_ROW + i
+      for row_offset, (_, row_data) in enumerate(df_result.iterrows()):
+        current_row = start_row + row_offset
         for col_idx, val in enumerate(row_data):
           cell = ws.cell(row=current_row, column=col_idx + 1)
           cell.value = val
+          cell.protection = copy.copy(Protection(locked=False))
 
           prev_cell = ws.cell(
-              row=max(START_ROW, current_row - 1), column=col_idx + 1
+              row=max(start_row, current_row - 1), column=col_idx + 1
           )
-          if prev_cell.font:
-            cell.font = Font(
-                name=prev_cell.font.name,
-                size=prev_cell.font.size,
-                bold=prev_cell.font.bold,
-                color=prev_cell.font.color,
-            )
-          if prev_cell.alignment:
-            cell.alignment = Alignment(
-                horizontal=prev_cell.alignment.horizontal,
-                vertical=prev_cell.alignment.vertical,
-                wrap_text=prev_cell.alignment.wrap_text,
-            )
-          if prev_cell.border:
-            cell.border = prev_cell.border
-          if prev_cell.fill and prev_cell.fill.fill_type:
-            cell.fill = prev_cell.fill
+          copy_cell_format(prev_cell, cell)
+          cell.protection = copy.copy(Protection(locked=False))
 
       wb.save(output_file)
-
-    print(f"  -> 成功: 保存先 [{output_file}]")
+      print(f"  -> 成功: 保存先 [{output_file}]")
 
   except Exception as e:
     print(f"  -> エラー発生 ({base_name}): {e}")
