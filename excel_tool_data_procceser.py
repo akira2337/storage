@@ -38,12 +38,62 @@ def normalize_circled_number(char):
   return CIRCLED_MAPPING.get(char, char)
 
 
+def expand_prefix_to_nums(prefix):
+  """プレフィックス（例: '①〜③、⑤' や '①②③'）から
+
+  該当する丸数字のリスト（重複なし・順序維持）を抽出・展開する関数
+  """
+  expanded = []
+  parts = re.split(r"[、,]", prefix)
+  all_circled_chars = r"[①-㉚❶-❿➀-➉➊-➓⓵-⓾]"
+
+  for part in parts:
+    part = part.strip()
+    if not part:
+      continue
+
+    # 範囲指定のチェック（例: ①〜③）
+    range_match = re.search(
+        rf"({all_circled_chars})\s*[〜〜-]\s*({all_circled_chars})", part
+    )
+    if range_match:
+      start_char, end_char = range_match.groups()
+      norm_start = normalize_circled_number(start_char)
+      norm_end = normalize_circled_number(end_char)
+      start_idx = CIRCLED_TO_IDX.get(norm_start, 0)
+      end_idx = CIRCLED_TO_IDX.get(norm_end, 0)
+      if start_idx <= end_idx:
+        for idx in range(start_idx, end_idx + 1):
+          if idx < len(CIRCLED_NUMS):
+            num_char = CIRCLED_NUMS[idx]
+            if num_char not in expanded:
+              expanded.append(num_char)
+      continue
+
+    # 個別または連続する丸数字のチェック
+    found_in_part = re.findall(rf"{all_circled_chars}", part)
+    if found_in_part:
+      for num_char in found_in_part:
+        norm_char = normalize_circled_number(num_char)
+        if norm_char in CIRCLED_TO_IDX:
+          if norm_char not in expanded:
+            expanded.append(norm_char)
+
+  return expanded
+
+
 def parse_cell_to_blocks(text):
+  """セル内のテキストを解析し、
+
+  {丸数字: [その丸数字が属するテキスト項目のリスト]} と、
+  共通テキストを抽出する
+  """
   if pd.isna(text) or not str(text).strip():
     return {}, []
 
   lines = [line.strip() for line in str(text).splitlines() if line.strip()]
-  mapping = {}
+  # 各丸数字に紐づくテキストブロックのリストを保持する辞書
+  mapping = {num: [] for num in CIRCLED_NUMS}
   common_texts = []
   all_circled_chars = r"[①-㉚❶-❿➀-➉➊-➓⓵-⓾]"
 
@@ -63,39 +113,11 @@ def parse_cell_to_blocks(text):
     elif not body:
       body = line
 
-    expanded_nums = set()
-    parts = re.split(r"[、,]", prefix)
+    nums_in_line = expand_prefix_to_nums(prefix)
 
-    for part in parts:
-      part = part.strip()
-      if not part:
-        continue
-
-      range_match = re.search(
-          rf"({all_circled_chars})\s*[〜〜-]\s*({all_circled_chars})", part
-      )
-      if range_match:
-        start_char, end_char = range_match.groups()
-        norm_start = normalize_circled_number(start_char)
-        norm_end = normalize_circled_number(end_char)
-        start_idx = CIRCLED_TO_IDX.get(norm_start, 0)
-        end_idx = CIRCLED_TO_IDX.get(norm_end, 0)
-        if start_idx <= end_idx:
-          for idx in range(start_idx, end_idx + 1):
-            if idx < len(CIRCLED_NUMS):
-              expanded_nums.add(CIRCLED_NUMS[idx])
-        continue
-
-      found_in_part = re.findall(rf"{all_circled_chars}", part)
-      if found_in_part:
-        for num_char in found_in_part:
-          norm_char = normalize_circled_number(num_char)
-          if norm_char in CIRCLED_TO_IDX:
-            expanded_nums.add(norm_char)
-
-    if expanded_nums:
-      for num in expanded_nums:
-        mapping[num] = body
+    if nums_in_line:
+      for num in nums_in_line:
+        mapping[num].append(body)
     else:
       common_texts.append(line)
 
@@ -150,7 +172,14 @@ for input_file in excel_files:
       tool_cell = row.iloc[TOOL_COL_IDX]
       tool_dict, tool_common = parse_cell_to_blocks(tool_cell)
 
-      if not tool_dict:
+      # ツール一覧に属する有効な丸数字を抽出（順番通り）
+      active_tool_nums = []
+      for num in CIRCLED_NUMS:
+        if num in tool_dict and tool_dict[num]:
+          active_tool_nums.append(num)
+
+      # ツール一覧に丸数字がない場合のフォールバック
+      if not active_tool_nums:
         new_row = row.copy()
         for col_idx in range(len(new_row)):
           val = new_row.iloc[col_idx]
@@ -159,6 +188,7 @@ for input_file in excel_files:
         new_rows.append(new_row)
         continue
 
+      # 各テキスト列のセルを事前に解析
       text_dicts = {}
       text_commons = {}
       for t_idx in TEXT_COL_INDICES:
@@ -170,23 +200,32 @@ for input_file in excel_files:
           text_dicts[t_idx] = {}
           text_commons[t_idx] = []
 
-      for num, tool_text in tool_dict.items():
+      # ツール一覧の各丸数字をベースに行を展開
+      for num in active_tool_nums:
         new_row = row.copy()
-        new_row.iloc[TOOL_COL_IDX] = tool_text
+        # ツール一覧の値をセット（例: ①ツールA）
+        tool_body = tool_dict[num][0]
+        new_row.iloc[TOOL_COL_IDX] = f"{num}{tool_body}"
 
+        # 各テキスト列の処理
         for t_idx in TEXT_COL_INDICES:
           if t_idx < len(row):
             t_dict = text_dicts[t_idx]
             t_comm = text_commons[t_idx]
 
-            if num in t_dict:
-              body_text = t_dict[num]
-              new_row.iloc[t_idx] = f"{num}：{body_text}"
+            if num in t_dict and t_dict[num]:
+              # 画像12のように、同じ丸数字に紐づくテキストを自動結合して整形
+              # 例: 連続・複数の場合は ①②③：テキスト1 や ①〜③：テキスト1 のようにまとめる
+              bodies = t_dict[num]
+              # ここでは該当する丸数字そのものを先頭につけて綺麗に結合
+              combined_body = "\n".join(bodies)
+              new_row.iloc[t_idx] = f"{num}：{combined_body}"
             elif t_comm:
               new_row.iloc[t_idx] = "\n".join(t_comm)
             else:
               new_row.iloc[t_idx] = "ー"
 
+        # その他の空白セルを「ー」で埋める
         for col_idx in range(len(new_row)):
           val = new_row.iloc[col_idx]
           if pd.isna(val) or str(val).strip() == "":
