@@ -1,6 +1,7 @@
 {
   "input_folder": "./input_folder",
-  "output_file": "output_processed.xlsx",
+  "output_folder": "./output_folder",
+  "target_sheet_name": "RPA取込シート",
   "header_row": 4,
   "tool_col_idx": 2,
   "text_col_indices": [3, 4, 5, 6, 7],
